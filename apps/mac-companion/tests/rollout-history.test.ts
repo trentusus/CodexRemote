@@ -177,6 +177,54 @@ test("RolloutHistoryStore exposes context compaction and background terminal car
   );
 });
 
+test("RolloutHistoryStore exposes the latest unanswered request_user_input prompt in the timeline", async () => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "codex-remote-rollout-history-plan-prompt-"));
+  const sessionsRoot = join(tempRoot, "2026", "03", "31");
+  const rolloutPath = join(
+    sessionsRoot,
+    "rollout-2026-03-31T09-00-00-chat-plan-prompt-test.jsonl",
+  );
+
+  await mkdir(sessionsRoot, { recursive: true });
+  await writeFile(
+    rolloutPath,
+    [
+      "{\"timestamp\":\"2026-03-31T09:00:00.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"request_user_input\",\"call_id\":\"call_plan_1\",\"arguments\":\"{\\\"questions\\\":[{\\\"header\\\":\\\"Next step\\\",\\\"id\\\":\\\"plan_action\\\",\\\"question\\\":\\\"How should Codex continue?\\\",\\\"options\\\":[{\\\"label\\\":\\\"Implement plan\\\",\\\"description\\\":\\\"Start coding now.\\\"},{\\\"label\\\":\\\"Other feedback\\\",\\\"description\\\":\\\"Keep discussing first.\\\"}]}]}\"}}",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const store = new RolloutHistoryStore(tempRoot);
+  const timeline = await store.loadTimeline("chat-plan-prompt-test");
+
+  assert.equal(timeline.planPrompt?.callId, "call_plan_1");
+  assert.deepEqual(timeline.planPrompt?.questions.map((question) => question.id), ["plan_action"]);
+});
+
+test("RolloutHistoryStore clears request_user_input prompts after function_call_output is recorded", async () => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "codex-remote-rollout-history-plan-prompt-answer-"));
+  const sessionsRoot = join(tempRoot, "2026", "03", "31");
+  const rolloutPath = join(
+    sessionsRoot,
+    "rollout-2026-03-31T09-05-00-chat-plan-prompt-answer-test.jsonl",
+  );
+
+  await mkdir(sessionsRoot, { recursive: true });
+  await writeFile(
+    rolloutPath,
+    [
+      "{\"timestamp\":\"2026-03-31T09:05:00.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"request_user_input\",\"call_id\":\"call_plan_2\",\"arguments\":\"{\\\"questions\\\":[{\\\"header\\\":\\\"Next step\\\",\\\"id\\\":\\\"plan_action\\\",\\\"question\\\":\\\"How should Codex continue?\\\",\\\"options\\\":[{\\\"label\\\":\\\"Implement plan\\\",\\\"description\\\":\\\"Start coding now.\\\"}]}]\"}}",
+      "{\"timestamp\":\"2026-03-31T09:05:02.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call_plan_2\",\"output\":\"{\\\"answers\\\":{\\\"plan_action\\\":{\\\"answers\\\":[\\\"Implement plan\\\"]}}}\"}}",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const store = new RolloutHistoryStore(tempRoot);
+  const timeline = await store.loadTimeline("chat-plan-prompt-answer-test");
+
+  assert.equal(timeline.planPrompt, undefined);
+});
+
 test("RolloutHistoryStore can expose the rollout path for a known chat", async () => {
   const tempRoot = await mkdtemp(join(tmpdir(), "codex-remote-rollout-history-path-"));
   const sessionsRoot = join(tempRoot, "2026", "03", "08");

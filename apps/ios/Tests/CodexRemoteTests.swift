@@ -250,6 +250,57 @@ final class CodexRemoteTests: XCTestCase {
         XCTAssertEqual(decoded.data.activities.first?.deletions, 16)
     }
 
+    func testRemoteChatTimelineDecodesPlanPrompt() throws {
+        let json = """
+        {
+          "data": {
+            "messages": [],
+            "activities": [],
+            "planPrompt": {
+              "callId": "call-plan-1",
+              "createdAt": 1773016247,
+              "questions": [
+                {
+                  "header": "Next step",
+                  "id": "plan_action",
+                  "question": "How should Codex continue?",
+                  "options": [
+                    {
+                      "label": "Implement plan",
+                      "description": "Start coding now."
+                    },
+                    {
+                      "label": "Other feedback",
+                      "description": "Keep discussing first."
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+        """.data(using: .utf8)!
+
+        let decoded = try JSONDecoder().decode(DataEnvelope<RemoteChatTimeline>.self, from: json)
+
+        XCTAssertEqual(decoded.data.planPrompt?.callId, "call-plan-1")
+        XCTAssertEqual(decoded.data.planPrompt?.questions.first?.id, "plan_action")
+        XCTAssertEqual(decoded.data.planPrompt?.questions.first?.options.count, 2)
+    }
+
+    func testPlanQuestionResponseRequestEncodesAnswersShape() throws {
+        let request = PlanQuestionResponseRequest(
+            answers: [
+                "plan_action": PlanQuestionAnswerEntry(answers: ["Implement plan"])
+            ]
+        )
+
+        let data = try JSONEncoder().encode(request)
+        let decoded = try JSONDecoder().decode(PlanQuestionResponseRequest.self, from: data)
+
+        XCTAssertEqual(decoded.answers["plan_action"]?.answers, ["Implement plan"])
+    }
+
     func testFileEditedActivityUsesEditedTitle() {
         XCTAssertEqual(ChatActivityKind.fileEdited.title(for: .completed), "Edited")
     }
@@ -507,6 +558,45 @@ final class CodexRemoteTests: XCTestCase {
         )
     }
 
+    func testExtractProposedPlanMarkdownReturnsInnerPlan() {
+        let markdown = """
+        I have a plan.
+        <proposed_plan>
+        # Plan
+        - First step
+        </proposed_plan>
+        """
+
+        XCTAssertEqual(
+            extractProposedPlanMarkdown(from: markdown),
+            """
+            # Plan
+            - First step
+            """
+        )
+    }
+
+    func testResolvedAssistantMessageDisplayTextStripsPlanTagsAndKeepsSurroundingText() {
+        let markdown = """
+        Intro context.
+        <proposed_plan>
+        # Plan
+        - First step
+        </proposed_plan>
+        Closing note.
+        """
+
+        XCTAssertEqual(
+            resolvedAssistantMessageDisplayText(markdown),
+            """
+            Intro context.
+            # Plan
+            - First step
+            Closing note.
+            """
+        )
+    }
+
     func testProjectContextDecodesGitMetadata() throws {
         let json = """
         {
@@ -637,6 +727,83 @@ final class CodexRemoteTests: XCTestCase {
         XCTAssertEqual(messages[1].phase, "final_answer")
         XCTAssertEqual(messages[1].text, "Saved answer")
         XCTAssertEqual(messages[1].workedDurationSeconds, 13)
+    }
+
+    @MainActor
+    func testApplyLoadedTimelineStoresAndClearsPlanPromptState() {
+        let viewModel = AppViewModel()
+        let prompt = makePlanPrompt()
+
+        viewModel.applyLoadedTimeline(
+            chatId: "chat-1",
+            timeline: RemoteChatTimeline(messages: [], activities: [], planPrompt: prompt)
+        )
+        viewModel.selectPlanAnswer(callId: prompt.callId, questionId: "plan_action", answer: "Implement plan")
+
+        XCTAssertEqual(viewModel.planPrompt(for: "chat-1")?.callId, prompt.callId)
+        XCTAssertEqual(viewModel.selectedPlanAnswer(callId: prompt.callId, questionId: "plan_action"), "Implement plan")
+
+        viewModel.applyLoadedTimeline(
+            chatId: "chat-1",
+            timeline: RemoteChatTimeline(messages: [], activities: [], planPrompt: nil)
+        )
+
+        XCTAssertNil(viewModel.planPrompt(for: "chat-1"))
+        XCTAssertNil(viewModel.selectedPlanAnswer(callId: prompt.callId, questionId: "plan_action"))
+    }
+
+    @MainActor
+    func testSubmitPlanPromptSendsResponseAndClearsPromptState() async {
+        let apiClient = MockAPIClient()
+        let viewModel = AppViewModel(apiClient: apiClient)
+        viewModel.host = "100.64.0.2"
+        viewModel.token = "device-token"
+        let prompt = makePlanPrompt()
+
+        viewModel.applyLoadedTimeline(
+            chatId: "chat-1",
+            timeline: RemoteChatTimeline(messages: [], activities: [], planPrompt: prompt)
+        )
+        viewModel.selectPlanAnswer(callId: prompt.callId, questionId: "plan_action", answer: "Implement plan")
+
+        XCTAssertTrue(viewModel.canSubmitPlanPrompt(prompt))
+
+        await viewModel.submitPlanPrompt(chatId: "chat-1", prompt: prompt)
+
+        XCTAssertEqual(apiClient.respondToPlanPromptCalls.count, 1)
+        XCTAssertEqual(apiClient.respondToPlanPromptCalls.first?.callId, prompt.callId)
+        XCTAssertEqual(
+            apiClient.respondToPlanPromptCalls.first?.response.answers["plan_action"]?.answers,
+            ["Implement plan"]
+        )
+        XCTAssertNil(viewModel.planPrompt(for: "chat-1"))
+        XCTAssertNil(viewModel.selectedPlanAnswer(callId: prompt.callId, questionId: "plan_action"))
+    }
+
+    @MainActor
+    func testImplementPlanSendsFollowUpMessageAndUpdatesRunState() async {
+        let apiClient = MockAPIClient()
+        apiClient.sendMessageResult = .success(TurnStartResponse(chatId: "chat-1", turnId: "turn-99"))
+        let viewModel = AppViewModel(apiClient: apiClient)
+        viewModel.host = "100.64.0.2"
+        viewModel.token = "device-token"
+
+        await viewModel.implementPlan(chatId: "chat-1")
+
+        XCTAssertEqual(apiClient.sendMessageCalls.count, 1)
+        XCTAssertEqual(apiClient.sendMessageCalls.first?.chatId, "chat-1")
+        XCTAssertEqual(apiClient.sendMessageCalls.first?.text, "Implement this plan.")
+        XCTAssertEqual(viewModel.messagesByChat["chat-1"]?.last?.text, "Implement this plan.")
+        XCTAssertEqual(viewModel.runStateByChat["chat-1"]?.activeTurnId, "turn-99")
+    }
+
+    @MainActor
+    func testRequestComposerFocusBumpsToken() {
+        let viewModel = AppViewModel()
+
+        XCTAssertEqual(viewModel.composerFocusRequestToken, 0)
+        viewModel.requestComposerFocus()
+        XCTAssertEqual(viewModel.composerFocusRequestToken, 1)
     }
 
     @MainActor
@@ -1714,8 +1881,21 @@ private final class MockAPIClient: APIClientProtocol {
         let attachments: [ComposerAttachment]
     }
 
+    struct SendMessageCall: Equatable {
+        let chatId: String
+        let text: String?
+        let attachments: [ComposerAttachment]
+    }
+
+    struct RespondToPlanPromptCall: Equatable {
+        let callId: String
+        let response: PlanQuestionResponseRequest
+    }
+
     var createChatCalls = 0
     var startChatCalls: [StartChatCall] = []
+    var sendMessageCalls: [SendMessageCall] = []
+    var respondToPlanPromptCalls: [RespondToPlanPromptCall] = []
     var startChatResult: Result<ChatStartResponse, Error> = .success(
         ChatStartResponse(
             chat: ChatThread(
@@ -1741,6 +1921,9 @@ private final class MockAPIClient: APIClientProtocol {
             }
         }
     }
+    var sendMessageResult: Result<TurnStartResponse, Error> = .success(
+        TurnStartResponse(chatId: "chat-1", turnId: "turn-1")
+    )
 
     func requestPairing(host: String, port: Int) async throws -> PairingRequestResponse {
         throw APIClientError.server("unused")
@@ -1824,7 +2007,7 @@ private final class MockAPIClient: APIClientProtocol {
     }
 
     func fetchTimeline(host: String, port: Int, token: String, chatId: String) async throws -> RemoteChatTimeline {
-        RemoteChatTimeline(messages: [], activities: [])
+        RemoteChatTimeline(messages: [], activities: [], planPrompt: nil)
     }
 
     func fetchChatRunState(host: String, port: Int, token: String, chatId: String) async throws -> RemoteChatRunState {
@@ -1832,7 +2015,8 @@ private final class MockAPIClient: APIClientProtocol {
     }
 
     func sendMessage(host: String, port: Int, token: String, chatId: String, text: String?, attachments: [ComposerAttachment]) async throws -> TurnStartResponse {
-        throw APIClientError.server("unused")
+        sendMessageCalls.append(SendMessageCall(chatId: chatId, text: text, attachments: attachments))
+        return try sendMessageResult.get()
     }
 
     func steerMessage(host: String, port: Int, token: String, chatId: String, text: String?, attachments: [ComposerAttachment]) async throws -> TurnSteerResponse {
@@ -1848,6 +2032,10 @@ private final class MockAPIClient: APIClientProtocol {
     }
 
     func sendApprovalDecision(host: String, port: Int, token: String, approvalId: String, decision: String) async throws {}
+
+    func respondToPlanPrompt(host: String, port: Int, token: String, callId: String, response: PlanQuestionResponseRequest) async throws {
+        respondToPlanPromptCalls.append(RespondToPlanPromptCall(callId: callId, response: response))
+    }
 
     func uploadDebugLog(host: String, port: Int, token: String, contents: String) async throws -> DebugLogUploadResult {
         DebugLogUploadResult(path: "logs/ios-device.ndjson", bytes: contents.utf8.count)
@@ -1873,4 +2061,28 @@ private func makePDFData(text: String) -> Data {
             withAttributes: attributes
         )
     }
+}
+
+private func makePlanPrompt(callId: String = "call-plan-1") -> PlanQuestionPrompt {
+    PlanQuestionPrompt(
+        callId: callId,
+        questions: [
+            PlanQuestion(
+                header: "Next step",
+                id: "plan_action",
+                question: "How should Codex continue?",
+                options: [
+                    PlanQuestionOption(
+                        label: "Implement plan",
+                        description: "Start coding now."
+                    ),
+                    PlanQuestionOption(
+                        label: "Other feedback",
+                        description: "Keep discussing first."
+                    ),
+                ]
+            )
+        ],
+        createdAt: 1_773_016_247
+    )
 }

@@ -4,6 +4,7 @@ import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { WebSocket } from "ws";
 
 import { PairingStore } from "../src/pairing/pairing-store.js";
 import { SessionState } from "../src/state/session-state.js";
@@ -24,6 +25,7 @@ class FakeCodexClient extends EventEmitter {
   public turnSteerRequests: Array<Record<string, unknown>> = [];
   public turnInterruptRequests: Array<Record<string, unknown>> = [];
   public threadReadRequests: Array<Record<string, unknown>> = [];
+  public responses: Array<{ id: number | string; result: unknown }> = [];
   public activeThreadReadTurnId: string | null = null;
   public threadReadErrorMessage: string | null = null;
 
@@ -96,8 +98,8 @@ class FakeCodexClient extends EventEmitter {
     throw new Error(`Unexpected method: ${method}`);
   }
 
-  public respond(): void {
-    // No-op for this test.
+  public respond(id: number | string, result: unknown): void {
+    this.responses.push({ id, result });
   }
 }
 
@@ -210,6 +212,8 @@ class LaggyThreadListCodexClient extends EventEmitter {
 }
 
 class FakeHistoryStore implements ChatHistoryStore {
+  public timelinePlanPrompt?: ChatTimeline["planPrompt"];
+
   public async loadMessages(chatId: string) {
     return (await this.loadTimeline(chatId)).messages;
   }
@@ -274,6 +278,7 @@ class FakeHistoryStore implements ChatHistoryStore {
           state: "completed",
         },
       ],
+      ...(this.timelinePlanPrompt ? { planPrompt: this.timelinePlanPrompt } : {}),
     };
   }
 }
@@ -1365,6 +1370,287 @@ test("createCompanionServer merges live explored cards into the chat timeline", 
         && activity.state === "completed"
       )),
     );
+  } finally {
+    await server.close();
+  }
+});
+
+test("createCompanionServer broadcasts and persists plan prompts from request_user_input", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "codex-remote-server-plan-prompt-test-"));
+  const tokenPath = join(dir, "tokens.json");
+  const logPath = join(dir, "companion.ndjson");
+
+  const tokenStore = new TokenStore(tokenPath);
+  await tokenStore.load();
+  const issued = await tokenStore.issueDeviceToken({ deviceName: "Plan Prompt Test Device" });
+
+  const logger = new CompanionLogger(logPath, "debug");
+  const codexClient = new FakeCodexClient();
+  const server = await createCompanionServer({
+    config: buildTestConfig({
+      tokenStorePath: tokenPath,
+      traceLogPath: logPath,
+    }),
+    tokenStore,
+    pairingStore: new PairingStore(60),
+    codexClient,
+    historyStore: new FakeHistoryStore(),
+    contextStore: new FakeProjectContextStore(),
+    state: new SessionState(),
+    logger,
+  });
+
+  await server.listen();
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+
+  const socket = new WebSocket(`ws://127.0.0.1:${address.port}/v1/stream?chatId=chat-1`, {
+    headers: {
+      authorization: `Bearer ${issued.token}`,
+    },
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    socket.once("open", () => resolve());
+    socket.once("error", reject);
+  });
+
+  const eventPromise = new Promise<{
+    event: string;
+    chatId: string;
+    payload: {
+      callId: string;
+      questions: Array<{ id: string; options: Array<{ label: string }> }>;
+    };
+  }>((resolve, reject) => {
+    socket.once("message", (data) => {
+      try {
+        resolve(JSON.parse(data.toString()) as {
+          event: string;
+          chatId: string;
+          payload: {
+            callId: string;
+            questions: Array<{ id: string; options: Array<{ label: string }> }>;
+          };
+        });
+      } catch (error) {
+        reject(error);
+      }
+    });
+    socket.once("error", reject);
+  });
+
+  codexClient.emit("serverRequest", {
+    id: "rpc-plan-1",
+    method: "request_user_input",
+    params: {
+      threadId: "chat-1",
+      callId: "call-plan-1",
+      questions: [
+        {
+          header: "Next step",
+          id: "plan_action",
+          question: "How should Codex continue?",
+          options: [
+            {
+              label: "Implement plan",
+              description: "Start coding right away.",
+            },
+            {
+              label: "Other feedback",
+              description: "Keep discussing the plan first.",
+            },
+          ],
+        },
+      ],
+    },
+  });
+
+  try {
+    const streamEvent = await eventPromise;
+    assert.equal(streamEvent.event, "plan_prompt");
+    assert.equal(streamEvent.chatId, "chat-1");
+    assert.equal(streamEvent.payload.callId, "call-plan-1");
+    assert.deepEqual(
+      streamEvent.payload.questions[0]?.options.map((option) => option.label),
+      ["Implement plan", "Other feedback"],
+    );
+
+    const response = await fetch(`http://127.0.0.1:${address.port}/v1/chats/chat-1/timeline`, {
+      headers: {
+        authorization: `Bearer ${issued.token}`,
+      },
+    });
+    const body = await response.json() as {
+      data: {
+        planPrompt?: {
+          callId: string;
+          questions: Array<{ id: string }>;
+        };
+      };
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(body.data.planPrompt?.callId, "call-plan-1");
+    assert.deepEqual(body.data.planPrompt?.questions.map((question) => question.id), ["plan_action"]);
+  } finally {
+    socket.close();
+    await new Promise<void>((resolve) => {
+      socket.once("close", () => resolve());
+    });
+    await server.close();
+  }
+});
+
+test("createCompanionServer returns persisted plan prompts in the chat timeline", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "codex-remote-server-saved-plan-prompt-test-"));
+  const tokenPath = join(dir, "tokens.json");
+  const logPath = join(dir, "companion.ndjson");
+
+  const tokenStore = new TokenStore(tokenPath);
+  await tokenStore.load();
+  const issued = await tokenStore.issueDeviceToken({ deviceName: "Saved Plan Prompt Test Device" });
+
+  const historyStore = new FakeHistoryStore();
+  historyStore.timelinePlanPrompt = {
+    callId: "call-plan-saved-1",
+    createdAt: 1_775_000_001,
+    questions: [
+      {
+        header: "Confirm",
+        id: "saved_action",
+        question: "What should happen next?",
+        options: [
+          {
+            label: "Implement plan",
+            description: "Start implementation now.",
+          },
+        ],
+      },
+    ],
+  };
+
+  const logger = new CompanionLogger(logPath, "debug");
+  const server = await createCompanionServer({
+    config: buildTestConfig({
+      tokenStorePath: tokenPath,
+      traceLogPath: logPath,
+    }),
+    tokenStore,
+    pairingStore: new PairingStore(60),
+    codexClient: new FakeCodexClient(),
+    historyStore,
+    contextStore: new FakeProjectContextStore(),
+    state: new SessionState(),
+    logger,
+  });
+
+  await server.listen();
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${address.port}/v1/chats/chat-1/timeline`, {
+      headers: {
+        authorization: `Bearer ${issued.token}`,
+      },
+    });
+    const body = await response.json() as {
+      data: {
+        planPrompt?: {
+          callId: string;
+          questions: Array<{ id: string }>;
+        };
+      };
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(body.data.planPrompt?.callId, "call-plan-saved-1");
+    assert.deepEqual(body.data.planPrompt?.questions.map((question) => question.id), ["saved_action"]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("createCompanionServer submits plan prompt answers as function_call_output", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "codex-remote-server-plan-prompt-response-test-"));
+  const tokenPath = join(dir, "tokens.json");
+  const logPath = join(dir, "companion.ndjson");
+
+  const tokenStore = new TokenStore(tokenPath);
+  await tokenStore.load();
+  const issued = await tokenStore.issueDeviceToken({ deviceName: "Plan Prompt Response Test Device" });
+
+  const logger = new CompanionLogger(logPath, "debug");
+  const codexClient = new FakeCodexClient();
+  const state = new SessionState();
+  state.createPlanPrompt({
+    callId: "call-plan-respond-1",
+    jsonRpcId: "rpc-plan-respond-1",
+    chatId: "chat-1",
+    questions: [
+      {
+        header: "Choose",
+        id: "plan_action",
+        question: "How should Codex continue?",
+        options: [
+          {
+            label: "Implement plan",
+            description: "Start now.",
+          },
+        ],
+      },
+    ],
+  });
+
+  const server = await createCompanionServer({
+    config: buildTestConfig({
+      tokenStorePath: tokenPath,
+      traceLogPath: logPath,
+    }),
+    tokenStore,
+    pairingStore: new PairingStore(60),
+    codexClient,
+    historyStore: new FakeHistoryStore(),
+    contextStore: new FakeProjectContextStore(),
+    state,
+    logger,
+  });
+
+  await server.listen();
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${address.port}/v1/plan-prompts/call-plan-respond-1/respond`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${issued.token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        answers: {
+          plan_action: {
+            answers: ["Implement plan"],
+          },
+        },
+      }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(codexClient.responses, [
+      {
+        id: "rpc-plan-respond-1",
+        result: JSON.stringify({
+          answers: {
+            plan_action: {
+              answers: ["Implement plan"],
+            },
+          },
+        }),
+      },
+    ]);
+    assert.equal(state.getPlanPrompt("call-plan-respond-1"), undefined);
   } finally {
     await server.close();
   }

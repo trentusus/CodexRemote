@@ -193,6 +193,7 @@ final class AppViewModel: ObservableObject {
     @Published var chatsByProjectId: [String: [ChatThread]] = [:]
     @Published var messagesByChat: [String: [ChatMessage]] = [:]
     @Published var activitiesByChat: [String: [ChatActivity]] = [:]
+    @Published var planPromptByChat: [String: PlanQuestionPrompt] = [:]
     @Published var runStateByChat: [String: RemoteChatRunState] = [:]
     @Published var projectContextByProjectId: [String: ProjectContext] = [:]
     @Published var gitBranches: [GitBranch] = []
@@ -209,6 +210,7 @@ final class AppViewModel: ObservableObject {
     @Published var composerText: String = ""
     @Published var composerAttachments: [ComposerAttachment] = []
     @Published var pendingApproval: ApprovalRequest?
+    @Published var composerFocusRequestToken = 0
 
     @Published var isPairingSheetPresented = false
     @Published var scanResultText: String = ""
@@ -229,6 +231,9 @@ final class AppViewModel: ObservableObject {
     private var queuedComposerDraftByChat: [String: QueuedComposerDraft] = [:]
     private var assistantMessageIDsByItemKey: [String: String] = [:]
     private var assistantMessagePhasesByItemKey: [String: String] = [:]
+    private var selectedPlanAnswersByCallId: [String: [String: String]] = [:]
+    private var submittingPlanPromptCallIds = Set<String>()
+    private var implementingPlanChatIds = Set<String>()
     private let dictationService: LiveDictationService
     private var dictationBaseText = ""
 
@@ -597,6 +602,7 @@ final class AppViewModel: ObservableObject {
         chatsByProjectId = [:]
         messagesByChat = [:]
         activitiesByChat = [:]
+        planPromptByChat = [:]
         runStateByChat = [:]
         projectContextByProjectId = [:]
         gitBranches = []
@@ -611,6 +617,8 @@ final class AppViewModel: ObservableObject {
         queuedComposerDraftByChat = [:]
         assistantMessageIDsByItemKey = [:]
         assistantMessagePhasesByItemKey = [:]
+        selectedPlanAnswersByCallId = [:]
+        submittingPlanPromptCallIds = []
 
         KeychainStore.delete("host")
         KeychainStore.delete("port")
@@ -1033,6 +1041,111 @@ final class AppViewModel: ObservableObject {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    func planPrompt(for chatId: String) -> PlanQuestionPrompt? {
+        planPromptByChat[chatId]
+    }
+
+    func selectedPlanAnswer(callId: String, questionId: String) -> String? {
+        selectedPlanAnswersByCallId[callId]?[questionId]
+    }
+
+    func selectPlanAnswer(callId: String, questionId: String, answer: String) {
+        var answers = selectedPlanAnswersByCallId[callId] ?? [:]
+        answers[questionId] = answer
+        selectedPlanAnswersByCallId[callId] = answers
+    }
+
+    func canSubmitPlanPrompt(_ prompt: PlanQuestionPrompt) -> Bool {
+        guard let answers = selectedPlanAnswersByCallId[prompt.callId] else {
+            return false
+        }
+
+        return prompt.questions.allSatisfy { question in
+            guard let answer = answers[question.id] else {
+                return false
+            }
+
+            return !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    func isSubmittingPlanPrompt(_ prompt: PlanQuestionPrompt) -> Bool {
+        submittingPlanPromptCallIds.contains(prompt.callId)
+    }
+
+    func submitPlanPrompt(chatId: String, prompt: PlanQuestionPrompt) async {
+        guard canSubmitPlanPrompt(prompt),
+              let answers = selectedPlanAnswersByCallId[prompt.callId]
+        else {
+            return
+        }
+
+        submittingPlanPromptCallIds.insert(prompt.callId)
+        defer { submittingPlanPromptCallIds.remove(prompt.callId) }
+
+        let response = PlanQuestionResponseRequest(
+            answers: Dictionary(uniqueKeysWithValues: prompt.questions.compactMap { question in
+                guard let answer = answers[question.id]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !answer.isEmpty
+                else {
+                    return nil
+                }
+
+                return (question.id, PlanQuestionAnswerEntry(answers: [answer]))
+            })
+        )
+
+        do {
+            try await apiClient.respondToPlanPrompt(
+                host: host,
+                port: port,
+                token: token,
+                callId: prompt.callId,
+                response: response
+            )
+            setPlanPrompt(chatId: chatId, prompt: nil)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func implementPlan(chatId: String) async {
+        guard !implementingPlanChatIds.contains(chatId) else {
+            return
+        }
+
+        implementingPlanChatIds.insert(chatId)
+        defer { implementingPlanChatIds.remove(chatId) }
+
+        let text = "Implement this plan."
+        let optimisticMessageId = appendMessage(chatId: chatId, role: "user", text: text)
+
+        do {
+            let result = try await apiClient.sendMessage(
+                host: host,
+                port: port,
+                token: token,
+                chatId: chatId,
+                text: text,
+                attachments: []
+            )
+            applyRunState(
+                RemoteChatRunState(
+                    chatId: chatId,
+                    isRunning: result.turnId != nil,
+                    activeTurnId: result.turnId
+                )
+            )
+        } catch {
+            removeMessage(chatId: chatId, messageId: optimisticMessageId)
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func requestComposerFocus() {
+        composerFocusRequestToken += 1
     }
 
     func refreshSelectedProjectContext() async {
@@ -1691,6 +1804,10 @@ final class AppViewModel: ObservableObject {
                         createdAt: createdAt
                     )
                 }
+            case "plan_prompt":
+                if let prompt = decodeJSONValue(envelope.payload, as: PlanQuestionPrompt.self) {
+                    setPlanPrompt(chatId: envelope.chatId, prompt: prompt)
+                }
             case "error":
                 errorMessage = findString(in: envelope.payload, keys: ["message", "error"])
             case "turn_completed":
@@ -1799,6 +1916,7 @@ final class AppViewModel: ObservableObject {
 
     func applyLoadedTimeline(chatId: String, timeline: RemoteChatTimeline) {
         applyLoadedMessages(chatId: chatId, messages: timeline.messages)
+        setPlanPrompt(chatId: chatId, prompt: timeline.planPrompt)
         activitiesByChat[chatId] = normalizeActivities(
             timeline.activities.map { activity in
                 ChatActivity(
@@ -1817,6 +1935,21 @@ final class AppViewModel: ObservableObject {
                 )
             }
         )
+    }
+
+    private func setPlanPrompt(chatId: String, prompt: PlanQuestionPrompt?) {
+        let previousCallId = planPromptByChat[chatId]?.callId
+
+        if previousCallId != prompt?.callId, let previousCallId {
+            selectedPlanAnswersByCallId.removeValue(forKey: previousCallId)
+            submittingPlanPromptCallIds.remove(previousCallId)
+        }
+
+        if let prompt {
+            planPromptByChat[chatId] = prompt
+        } else {
+            planPromptByChat.removeValue(forKey: chatId)
+        }
     }
 
     func applyRunState(_ runState: RemoteChatRunState) {
@@ -2238,6 +2371,17 @@ final class AppViewModel: ObservableObject {
         default:
             return nil
         }
+    }
+
+    private func decodeJSONValue<T: Decodable>(_ value: JSONValue, as type: T.Type) -> T? {
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+
+        guard let data = try? encoder.encode(value) else {
+            return nil
+        }
+
+        return try? decoder.decode(type, from: data)
     }
 
     private func extractTurnId(from payload: JSONValue) -> String? {

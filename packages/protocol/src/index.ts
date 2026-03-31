@@ -26,6 +26,32 @@ export interface Message {
   workedDurationSeconds?: number;
 }
 
+export interface PlanOption {
+  label: string;
+  description: string;
+}
+
+export interface PlanQuestion {
+  header: string;
+  id: string;
+  question: string;
+  options: PlanOption[];
+}
+
+export interface PlanPrompt {
+  callId: string;
+  questions: PlanQuestion[];
+  createdAt: number;
+}
+
+export interface PlanQuestionAnswer {
+  answers: string[];
+}
+
+export interface PlanPromptResponse {
+  answers: Record<string, PlanQuestionAnswer>;
+}
+
 export type ChatActivityKind =
   | "thinking"
   | "exploring"
@@ -55,6 +81,7 @@ export interface ChatActivity {
 export interface ChatTimeline {
   messages: Message[];
   activities: ChatActivity[];
+  planPrompt?: PlanPrompt;
 }
 
 export type ApprovalKind = "command" | "fileChange";
@@ -93,6 +120,7 @@ export type StreamEventName =
   | "item_started"
   | "item_completed"
   | "approval_required"
+  | "plan_prompt"
   | "turn_completed"
   | "error";
 

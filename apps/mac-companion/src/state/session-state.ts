@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import type { ApprovalKind, ChatActivity } from "@codex-remote/protocol";
+import type { ApprovalKind, ChatActivity, PlanPrompt } from "@codex-remote/protocol";
 
 export interface PendingApproval {
   approvalId: string;
@@ -9,6 +9,11 @@ export interface PendingApproval {
   kind: ApprovalKind;
   summary: string;
   createdAt: number;
+}
+
+export interface PendingPlanPrompt extends PlanPrompt {
+  jsonRpcId: number | string;
+  chatId: string;
 }
 
 export interface KnownProject {
@@ -36,6 +41,8 @@ export class SessionState {
   private readonly knownProjects = new Map<string, KnownProject>();
   private readonly knownChats = new Map<string, KnownChat>();
   private readonly activitiesByChat = new Map<string, Map<string, ChatActivity>>();
+  private readonly pendingPlanPromptsByCallId = new Map<string, PendingPlanPrompt>();
+  private readonly pendingPlanPromptCallIdsByChat = new Map<string, string[]>();
 
   public createApproval(input: Omit<PendingApproval, "approvalId" | "createdAt">): PendingApproval {
     const pending: PendingApproval = {
@@ -53,6 +60,61 @@ export class SessionState {
       return undefined;
     }
     this.pendingApprovals.delete(approvalId);
+    return pending;
+  }
+
+  public createPlanPrompt(input: Omit<PendingPlanPrompt, "createdAt"> & { createdAt?: number }): PendingPlanPrompt {
+    const pending: PendingPlanPrompt = {
+      createdAt: input.createdAt ?? Date.now(),
+      ...input,
+    };
+    this.pendingPlanPromptsByCallId.set(pending.callId, pending);
+
+    const callIds = this.pendingPlanPromptCallIdsByChat.get(pending.chatId) ?? [];
+    const filtered = callIds.filter((callId) => callId !== pending.callId);
+    filtered.push(pending.callId);
+    this.pendingPlanPromptCallIdsByChat.set(pending.chatId, filtered);
+
+    return pending;
+  }
+
+  public getPlanPrompt(callId: string): PendingPlanPrompt | undefined {
+    return this.pendingPlanPromptsByCallId.get(callId);
+  }
+
+  public getLatestPlanPrompt(chatId: string): PendingPlanPrompt | undefined {
+    const callIds = this.pendingPlanPromptCallIdsByChat.get(chatId) ?? [];
+    let latest: PendingPlanPrompt | undefined;
+
+    for (const callId of callIds) {
+      const candidate = this.pendingPlanPromptsByCallId.get(callId);
+      if (!candidate) {
+        continue;
+      }
+
+      if (!latest || candidate.createdAt >= latest.createdAt) {
+        latest = candidate;
+      }
+    }
+
+    return latest;
+  }
+
+  public popPlanPrompt(callId: string): PendingPlanPrompt | undefined {
+    const pending = this.pendingPlanPromptsByCallId.get(callId);
+    if (!pending) {
+      return undefined;
+    }
+
+    this.pendingPlanPromptsByCallId.delete(callId);
+    const callIds = this.pendingPlanPromptCallIdsByChat.get(pending.chatId) ?? [];
+    const filtered = callIds.filter((candidate) => candidate !== callId);
+    if (filtered.length === 0) {
+      this.pendingPlanPromptCallIdsByChat.delete(pending.chatId);
+    } else {
+      this.pendingPlanPromptCallIdsByChat.set(pending.chatId, filtered);
+    }
+
     return pending;
   }
 

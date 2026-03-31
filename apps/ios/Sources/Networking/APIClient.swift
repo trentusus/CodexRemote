@@ -65,6 +65,7 @@ protocol APIClientProtocol {
     func stopTurn(host: String, port: Int, token: String, chatId: String) async throws -> TurnStopResponse
     func transcribeDictation(host: String, port: Int, token: String, filename: String, mimeType: String, audioData: Data, language: String?) async throws -> DictationTranscriptionResponse
     func sendApprovalDecision(host: String, port: Int, token: String, approvalId: String, decision: String) async throws
+    func respondToPlanPrompt(host: String, port: Int, token: String, callId: String, response: PlanQuestionResponseRequest) async throws
     func uploadDebugLog(host: String, port: Int, token: String, contents: String) async throws -> DebugLogUploadResult
     func openStream(host: String, port: Int, token: String, chatId: String) throws -> URLSessionWebSocketTask
 }
@@ -420,6 +421,26 @@ class APIClient: APIClientProtocol {
             token: token
         )
         request.httpBody = try encoder.encode(["decision": decision])
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validateResponse(response: response, data: data)
+    }
+
+    func respondToPlanPrompt(
+        host: String,
+        port: Int,
+        token: String,
+        callId: String,
+        response planResponse: PlanQuestionResponseRequest
+    ) async throws {
+        var request = try buildRequest(
+            host: host,
+            port: port,
+            path: "/v1/plan-prompts/\(callId)/respond",
+            method: "POST",
+            token: token
+        )
+        request.httpBody = try encoder.encode(planResponse)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         try validateResponse(response: response, data: data)

@@ -23,6 +23,34 @@ struct ApprovalRequest: Codable, Identifiable, Hashable {
     let createdAt: TimeInterval
 }
 
+struct PlanQuestionOption: Codable, Hashable {
+    let label: String
+    let description: String
+}
+
+struct PlanQuestion: Codable, Hashable, Identifiable {
+    let header: String
+    let id: String
+    let question: String
+    let options: [PlanQuestionOption]
+}
+
+struct PlanQuestionPrompt: Codable, Hashable, Identifiable {
+    let callId: String
+    let questions: [PlanQuestion]
+    let createdAt: TimeInterval
+
+    var id: String { callId }
+}
+
+struct PlanQuestionAnswerEntry: Codable, Hashable {
+    let answers: [String]
+}
+
+struct PlanQuestionResponseRequest: Codable, Hashable {
+    let answers: [String: PlanQuestionAnswerEntry]
+}
+
 struct PairingRequestResponse: Codable {
     let pairingId: String
     let nonce: String
@@ -181,6 +209,7 @@ struct RemoteChatActivity: Codable, Hashable {
 struct RemoteChatTimeline: Codable, Hashable {
     let messages: [RemoteChatMessage]
     let activities: [RemoteChatActivity]
+    let planPrompt: PlanQuestionPrompt?
 }
 
 struct RemoteChatRunState: Codable, Hashable {

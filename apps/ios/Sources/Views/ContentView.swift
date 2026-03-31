@@ -969,6 +969,31 @@ func normalizeHeadingMarkdown(_ markdown: String) -> String {
         .joined(separator: "\n")
 }
 
+func extractProposedPlanMarkdown(from text: String) -> String? {
+    guard let startRange = text.range(of: "<proposed_plan>"),
+          let endRange = text.range(of: "</proposed_plan>"),
+          startRange.upperBound <= endRange.lowerBound
+    else {
+        return nil
+    }
+
+    let planBody = text[startRange.upperBound..<endRange.lowerBound]
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return planBody.isEmpty ? nil : String(planBody)
+}
+
+func resolvedAssistantMessageDisplayText(_ text: String) -> String {
+    guard extractProposedPlanMarkdown(from: text) != nil else {
+        return text
+    }
+
+    let stripped = text
+        .replacingOccurrences(of: "<proposed_plan>", with: "")
+        .replacingOccurrences(of: "</proposed_plan>", with: "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return stripped.isEmpty ? text : stripped
+}
+
 private enum FinalAnswerBlock: Equatable {
     case heading(String)
     case paragraph(String)
@@ -1384,7 +1409,7 @@ private struct ChatTranscriptView: View {
                         ForEach(timelineItems) { item in
                             switch item {
                             case .message(let message):
-                                MessageRow(message: message)
+                                MessageRow(chatId: chatId, message: message)
                                     .id(item.id)
                             case .activity(let activity):
                                 ActivityRow(activity: activity)
@@ -1395,6 +1420,10 @@ private struct ChatTranscriptView: View {
 
                     if let pendingApproval = viewModel.pendingApproval {
                         PendingApprovalBanner(approval: pendingApproval)
+                    }
+
+                    if let planPrompt = viewModel.planPrompt(for: chatId) {
+                        PlanPromptCard(chatId: chatId, prompt: planPrompt)
                     }
 
                     Color.clear
@@ -1553,9 +1582,125 @@ private struct PendingApprovalBanner: View {
     }
 }
 
+private struct PlanPromptCard: View {
+    @EnvironmentObject private var viewModel: AppViewModel
+
+    let chatId: String
+    let prompt: PlanQuestionPrompt
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 8) {
+                Image(systemName: "list.bullet.clipboard")
+                    .foregroundStyle(RemotePalette.tint)
+                Text("Plan input needed")
+                    .font(.headline)
+            }
+
+            ForEach(prompt.questions) { question in
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(question.header)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.secondary)
+
+                    Text(question.question)
+                        .font(.system(size: 16, weight: .medium))
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(question.options, id: \.label) { option in
+                            Button {
+                                viewModel.selectPlanAnswer(
+                                    callId: prompt.callId,
+                                    questionId: question.id,
+                                    answer: option.label
+                                )
+                            } label: {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: viewModel.selectedPlanAnswer(
+                                            callId: prompt.callId,
+                                            questionId: question.id
+                                        ) == option.label ? "checkmark.circle.fill" : "circle")
+                                        .foregroundStyle(
+                                            viewModel.selectedPlanAnswer(
+                                                callId: prompt.callId,
+                                                questionId: question.id
+                                            ) == option.label ? RemotePalette.tint : .secondary
+                                        )
+
+                                        Text(option.label)
+                                            .font(.system(size: 15, weight: .semibold))
+                                            .multilineTextAlignment(.leading)
+                                    }
+
+                                    Text(option.description)
+                                        .font(.system(size: 13))
+                                        .foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                        .padding(.leading, 28)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(12)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                        .fill(viewModel.selectedPlanAnswer(
+                                            callId: prompt.callId,
+                                            questionId: question.id
+                                        ) == option.label ? RemotePalette.tint.opacity(0.10) : RemotePalette.card)
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                        .stroke(
+                                            viewModel.selectedPlanAnswer(
+                                                callId: prompt.callId,
+                                                questionId: question.id
+                                            ) == option.label ? RemotePalette.tint.opacity(0.35) : RemotePalette.border,
+                                            lineWidth: 1
+                                        )
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+
+            Button {
+                Task {
+                    await viewModel.submitPlanPrompt(chatId: chatId, prompt: prompt)
+                }
+            } label: {
+                HStack {
+                    Spacer()
+                    if viewModel.isSubmittingPlanPrompt(prompt) {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Text("Submit selections")
+                            .font(.system(size: 15, weight: .semibold))
+                    }
+                    Spacer()
+                }
+                .padding(.vertical, 12)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!viewModel.canSubmitPlanPrompt(prompt) || viewModel.isSubmittingPlanPrompt(prompt))
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RemotePalette.card, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(RemotePalette.border, lineWidth: 1)
+        )
+    }
+}
+
 private struct MessageRow: View {
     @Environment(\.colorScheme) private var colorScheme
 
+    let chatId: String
     let message: ChatMessage
 
     private var style: ChatSurfaceMessageStyle {
@@ -1566,6 +1711,10 @@ private struct MessageRow: View {
         ChatMessageCopyPlacement.resolve(role: message.role)
     }
 
+    private var displayText: String {
+        message.role == "assistant" ? resolvedAssistantMessageDisplayText(message.text) : message.text
+    }
+
     var body: some View {
         Group {
             switch style {
@@ -1574,7 +1723,7 @@ private struct MessageRow: View {
                     Spacer(minLength: 44)
 
                     VStack(alignment: .trailing, spacing: 6) {
-                        Text(message.text)
+                        Text(displayText)
                             .font(.body)
                             .foregroundStyle(RemotePalette.userText)
                             .multilineTextAlignment(.leading)
@@ -1584,7 +1733,7 @@ private struct MessageRow: View {
                             .frame(maxWidth: 320, alignment: .trailing)
 
                         MessageCopyButton(
-                            text: message.text,
+                            text: displayText,
                             placement: copyPlacement
                         )
                         .frame(maxWidth: 320, alignment: .trailing)
@@ -1595,12 +1744,13 @@ private struct MessageRow: View {
             case .assistantFullWidth:
                 if message.phase == "final_answer" {
                     FinalAnswerMessageRow(
+                        chatId: chatId,
                         message: message,
                         colorScheme: colorScheme
                     )
                 } else {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(message.text)
+                        Text(displayText)
                             .font(.body)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.leading)
@@ -1609,7 +1759,7 @@ private struct MessageRow: View {
                             .textSelection(.enabled)
 
                         MessageCopyButton(
-                            text: message.text,
+                            text: displayText,
                             placement: copyPlacement
                         )
                     }
@@ -1675,11 +1825,22 @@ private struct MessageCopyButton: View {
 }
 
 private struct FinalAnswerMessageRow: View {
+    @EnvironmentObject private var viewModel: AppViewModel
+
+    let chatId: String
     let message: ChatMessage
     let colorScheme: ColorScheme
 
     private var blocks: [FinalAnswerBlock] {
-        parseFinalAnswerBlocks(message.text)
+        parseFinalAnswerBlocks(resolvedAssistantMessageDisplayText(message.text))
+    }
+
+    private var displayText: String {
+        resolvedAssistantMessageDisplayText(message.text)
+    }
+
+    private var showsPlanActions: Bool {
+        extractProposedPlanMarkdown(from: message.text) != nil
     }
 
     var body: some View {
@@ -1749,9 +1910,31 @@ private struct FinalAnswerMessageRow: View {
             }
 
             MessageCopyButton(
-                text: message.text,
+                text: displayText,
                 placement: .leading
             )
+
+            if showsPlanActions {
+                HStack(spacing: 10) {
+                    Button {
+                        Task {
+                            await viewModel.implementPlan(chatId: chatId)
+                        }
+                    } label: {
+                        Text("Implement plan")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button {
+                        viewModel.requestComposerFocus()
+                    } label: {
+                        Text("Other feedback")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -2314,6 +2497,9 @@ private struct ComposerDock: View {
             Task {
                 await handleSelectedPhotos(items)
             }
+        }
+        .onChange(of: viewModel.composerFocusRequestToken) { _, _ in
+            composerFocused = true
         }
     }
 

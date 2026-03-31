@@ -1,7 +1,7 @@
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
-import type { ChatActivity, ChatTimeline, Message } from "@codex-remote/protocol";
+import type { ChatActivity, ChatTimeline, Message, PlanPrompt } from "@codex-remote/protocol";
 
 import {
   buildBackgroundTerminalActivity,
@@ -9,6 +9,7 @@ import {
   mapApplyPatchPayloadToActivities,
   mergeChatActivities,
 } from "./chat-activities.js";
+import { parsePlanPrompt } from "../plan-prompts.js";
 
 export interface ChatHistoryStore {
   loadMessages(chatId: string): Promise<Message[]>;
@@ -53,6 +54,8 @@ export class RolloutHistoryStore implements ChatHistoryStore {
     const activities: ChatActivity[] = [];
     const functionCallsById = new Map<string, RolloutFunctionCallState>();
     const backgroundCommandsBySessionId = new Map<string, string>();
+    const planPromptsByCallId = new Map<string, PlanPrompt>();
+    const answeredPlanPromptCallIds = new Set<string>();
 
     for (const [index, line] of contents.split("\n").entries()) {
       const trimmed = line.trim();
@@ -73,6 +76,7 @@ export class RolloutHistoryStore implements ChatHistoryStore {
       }
 
       rememberRolloutFunctionCall(parsed, functionCallsById);
+      rememberPlanPrompt(parsed, planPromptsByCallId, answeredPlanPromptCallIds);
 
       const rolloutActivities = mapRolloutLineToActivities(
         index,
@@ -85,9 +89,12 @@ export class RolloutHistoryStore implements ChatHistoryStore {
       }
     }
 
+    const planPrompt = selectLatestPendingPlanPrompt(planPromptsByCallId, answeredPlanPromptCallIds);
+
     return {
       messages: attachWorkedDurations(messages),
       activities: mergeChatActivities(activities),
+      ...(planPrompt ? { planPrompt } : {}),
     };
   }
 
@@ -309,6 +316,56 @@ function rememberRolloutFunctionCall(
     name: payload.name,
     ...(typeof payload.arguments === "string" ? { arguments: payload.arguments } : {}),
   });
+}
+
+function rememberPlanPrompt(
+  line: RolloutLine,
+  planPromptsByCallId: Map<string, PlanPrompt>,
+  answeredPlanPromptCallIds: Set<string>,
+): void {
+  if (line.type !== "response_item") {
+    return;
+  }
+
+  const payload = asRecord(line.payload);
+  if (!payload) {
+    return;
+  }
+
+  if (payload.type === "function_call" && payload.name === "request_user_input" && typeof payload.call_id === "string") {
+    const prompt = parsePlanPrompt(
+      payload.call_id,
+      payload.arguments,
+      parseCreatedAtSeconds(line.timestamp),
+    );
+    if (prompt) {
+      planPromptsByCallId.set(prompt.callId, prompt);
+    }
+    return;
+  }
+
+  if (payload.type === "function_call_output" && typeof payload.call_id === "string") {
+    answeredPlanPromptCallIds.add(payload.call_id);
+  }
+}
+
+function selectLatestPendingPlanPrompt(
+  planPromptsByCallId: Map<string, PlanPrompt>,
+  answeredPlanPromptCallIds: Set<string>,
+): PlanPrompt | undefined {
+  let latest: PlanPrompt | undefined;
+
+  for (const prompt of planPromptsByCallId.values()) {
+    if (answeredPlanPromptCallIds.has(prompt.callId)) {
+      continue;
+    }
+
+    if (!latest || prompt.createdAt >= latest.createdAt) {
+      latest = prompt;
+    }
+  }
+
+  return latest;
 }
 
 function mapRolloutFunctionCallOutputToActivity(

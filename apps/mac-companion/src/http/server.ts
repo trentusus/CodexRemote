@@ -17,6 +17,7 @@ import {
   type Message,
   type PairingConfirmRequest,
   type PairingRequestResponse,
+  type PlanPrompt,
   type StreamEvent,
 } from "@codex-remote/protocol";
 
@@ -40,6 +41,12 @@ import {
   OpenAITranscriptionService,
   TranscriptionServiceError,
 } from "../openai/transcription.js";
+import {
+  buildPlanPromptResponseOutput,
+  extractPlanPromptCallId,
+  parsePlanPrompt,
+  parsePlanPromptResponse,
+} from "../plan-prompts.js";
 import {
   buildChatTitleSeed,
   buildTurnStartInput,
@@ -283,6 +290,34 @@ function mapApprovalSummary(serverEvent: CodexServerRequestEvent): {
 
   const reason = typeof params.reason === "string" ? params.reason : "File change approval request";
   return { kind: "fileChange", summary: reason };
+}
+
+function mergePlanPrompt(
+  storedPlanPrompt: PlanPrompt | undefined,
+  livePlanPrompt: PlanPrompt | undefined,
+): PlanPrompt | undefined {
+  if (!storedPlanPrompt) {
+    return livePlanPrompt;
+  }
+
+  if (!livePlanPrompt) {
+    return storedPlanPrompt;
+  }
+
+  return livePlanPrompt.createdAt >= storedPlanPrompt.createdAt ? livePlanPrompt : storedPlanPrompt;
+}
+
+function extractPlanPromptInput(params: unknown): unknown {
+  if (!params || typeof params !== "object" || Array.isArray(params)) {
+    return params;
+  }
+
+  const typed = params as Record<string, unknown>;
+  if (typed.arguments !== undefined) {
+    return typed.arguments;
+  }
+
+  return typed;
 }
 
 function normalizeDecision(decision: ApprovalDecision): string {
@@ -1144,9 +1179,11 @@ export async function createCompanionServer(deps: Dependencies): Promise<{
     try {
       const storedTimeline = await deps.historyStore.loadTimeline(chatId);
       const liveActivities = deps.state.listChatActivities(chatId);
+      const planPrompt = mergePlanPrompt(storedTimeline.planPrompt, deps.state.getLatestPlanPrompt(chatId));
       const timeline: ChatTimeline = {
         messages: storedTimeline.messages,
         activities: mergeChatActivities(storedTimeline.activities, liveActivities),
+        ...(planPrompt ? { planPrompt } : {}),
       };
 
       chatLog.info("chat_timeline_loaded", {
@@ -1479,6 +1516,44 @@ export async function createCompanionServer(deps: Dependencies): Promise<{
     }
   });
 
+  app.post("/v1/plan-prompts/:callId/respond", authMiddleware, async (request, response) => {
+    const callId = assertNonEmptyString(request.params.callId, "callId");
+    const traceId = getTraceId(response);
+    const parsedResponse = parsePlanPromptResponse(request.body);
+
+    if (!parsedResponse) {
+      chatLog.warn("plan_prompt_response_invalid", {
+        traceId,
+        callId,
+        deviceId: response.locals.auth?.deviceId,
+      });
+      response.status(400).json({ error: "Invalid plan prompt response payload" });
+      return;
+    }
+
+    const pending = deps.state.popPlanPrompt(callId);
+    if (!pending) {
+      chatLog.warn("plan_prompt_not_found", {
+        traceId,
+        callId,
+        deviceId: response.locals.auth?.deviceId,
+      });
+      response.status(404).json({ error: "Plan prompt not found" });
+      return;
+    }
+
+    deps.codexClient.respond(pending.jsonRpcId, buildPlanPromptResponseOutput(parsedResponse));
+    chatLog.info("plan_prompt_responded", {
+      traceId,
+      callId,
+      chatId: pending.chatId,
+      deviceId: response.locals.auth?.deviceId,
+      answerCount: Object.keys(parsedResponse.answers).length,
+    });
+
+    response.json({ ok: true });
+  });
+
   app.post("/v1/approvals/:approvalId", authMiddleware, async (request, response) => {
     const approvalId = assertNonEmptyString(request.params.approvalId, "approvalId");
     const body = request.body as { decision?: ApprovalDecision };
@@ -1609,22 +1684,68 @@ export async function createCompanionServer(deps: Dependencies): Promise<{
   });
 
   deps.codexClient.on("serverRequest", (event: CodexServerRequestEvent) => {
+    const params = (event.params ?? {}) as Record<string, unknown>;
+    const chatId =
+      extractChatIdFromCodexPayload(event.params, deps.state)
+      ?? (typeof params.threadId === "string" ? params.threadId : undefined);
+    const traceId =
+      typeof params.turnId === "string" ? deps.state.getTraceByTurn(params.turnId) : undefined;
+
     if (
       event.method !== "item/commandExecution/requestApproval" &&
-      event.method !== "item/fileChange/requestApproval"
+      event.method !== "item/fileChange/requestApproval" &&
+      event.method !== "request_user_input"
     ) {
       return;
     }
 
-    const params = (event.params ?? {}) as Record<string, unknown>;
-    const chatId =
-      typeof params.threadId === "string"
-        ? params.threadId
-        : typeof params.turnId === "string"
-          ? deps.state.getChatByTurn(params.turnId)
-          : undefined;
-    const traceId =
-      typeof params.turnId === "string" ? deps.state.getTraceByTurn(params.turnId) : undefined;
+    if (event.method === "request_user_input") {
+      if (!chatId) {
+        chatLog.warn("plan_prompt_missing_chat", {
+          traceId,
+          method: event.method,
+          requestId: event.id,
+        });
+        deps.codexClient.respond(event.id, JSON.stringify({ answers: {} }));
+        return;
+      }
+
+      const callId = extractPlanPromptCallId(params) ?? String(event.id);
+      const prompt = parsePlanPrompt(callId, extractPlanPromptInput(params), Date.now());
+      if (!prompt) {
+        chatLog.warn("plan_prompt_invalid", {
+          traceId,
+          chatId,
+          method: event.method,
+          requestId: event.id,
+          callId,
+        });
+        deps.codexClient.respond(event.id, JSON.stringify({ answers: {} }));
+        return;
+      }
+
+      const pendingPrompt = deps.state.createPlanPrompt({
+        ...prompt,
+        jsonRpcId: event.id,
+        chatId,
+      });
+
+      const planPromptEvent: StreamEvent = {
+        event: "plan_prompt",
+        chatId,
+        payload: pendingPrompt,
+        timestamp: Date.now(),
+      };
+
+      chatLog.info("plan_prompt_requested", {
+        traceId,
+        chatId,
+        callId: pendingPrompt.callId,
+        questionCount: pendingPrompt.questions.length,
+      });
+      broadcastEvent(connectionsByChat, planPromptEvent);
+      return;
+    }
 
     if (!chatId) {
       chatLog.warn("approval_request_missing_chat", {
